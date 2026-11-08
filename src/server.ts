@@ -212,3 +212,302 @@ export default {
     );
   }
 } satisfies ExportedHandler<Env>;
+
+type SearchResult = {
+  title: string;
+  url: string;
+  description: string;
+};
+
+async function searchBusinessWeb(
+  query: string,
+  apiKey: string
+): Promise<SearchResult[]> {
+  const url = new URL("https://api.search.brave.com/res/v1/web/search");
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", "8");
+
+  const response = await fetch(url, {
+    headers: {
+      "X-Subscription-Token": apiKey,
+      Accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Search failed: ${response.status}`);
+  }
+
+  const data = await response.json() as {
+    web?: { results?: Array<{
+      title?: string;
+      url?: string;
+      description?: string;
+    }> };
+  };
+
+  return (data.web?.results ?? []).map((item) => ({
+    title: item.title ?? "Untitled",
+    url: item.url ?? "",
+    description: item.description ?? ""
+  })).filter((item) => item.url);
+}
+
+function validatePublicUrl(input: string): URL {
+  const url = new URL(input);
+
+  if (url.protocol !== "https:") {
+    throw new Error("Only HTTPS websites are permitted.");
+  }
+
+  const host = url.hostname.toLowerCase();
+
+  if (
+    !host.includes(".") ||
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    /^[0-9.]+$/.test(host) ||
+    host.includes(":") ||
+    url.username ||
+    url.password ||
+    (url.port && url.port !== "443")
+  ) {
+    throw new Error("This destination is not permitted.");
+  }
+
+  return url;
+}
+
+async function readPublicWebPage(input: string) {
+  let url = validatePublicUrl(input);
+  let response: Response | undefined;
+
+  // Manually validate redirects instead of blindly following them.
+  for (let i = 0; i < 4; i++) {
+    response = await fetch(url, {
+      redirect: "manual",
+      headers: {
+        "User-Agent": "BusinessResearchAgent/1.0",
+        Accept: "text/html,text/plain"
+      }
+    });
+
+    if (
+      response.status >= 300 &&
+      response.status < 400
+    ) {
+      const location = response.headers.get("Location");
+      if (!location) throw new Error("Invalid redirect.");
+      url = validatePublicUrl(new URL(location, url).toString());
+      continue;
+    }
+
+    break;
+  }
+
+  if (!response || !response.ok) {
+    throw new Error("Unable to retrieve this webpage.");
+  }
+
+  const type = response.headers.get("content-type") ?? "";
+
+  if (!type.includes("text/html") && !type.includes("text/plain")) {
+    throw new Error("Only HTML and plain-text pages are supported.");
+  }
+
+  const raw = (await response.text()).slice(0, 50000);
+
+  const text = raw
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    url: url.toString(),
+    content: text.slice(0, 12000)
+  };
+}
+
+searchWeb: tool({
+  description:
+    "Search the public internet for business opportunities, trends, competitors, products, customer demand, and market research. Always report source URLs.",
+  inputSchema: z.object({
+    query: z.string().min(3).max(300)
+  }),
+  execute: async ({ query }) => {
+    if (!this.env.BRAVE_SEARCH_API_KEY) {
+      return { error: "Search API key is not configured." };
+    }
+
+    return await searchBusinessWeb(
+      query,
+      this.env.BRAVE_SEARCH_API_KEY
+    );
+  }
+}),
+
+readWebPage: tool({
+  description:
+    "Read a public HTTPS webpage and extract its text for market research.",
+  inputSchema: z.object({
+    url: z.string().url()
+  }),
+  execute: async ({ url }) => {
+    return await readPublicWebPage(url);
+  }
+}),
+
+saveOpportunity: tool({
+  description:
+    "Save a researched business opportunity to persistent agent storage.",
+  inputSchema: z.object({
+    name: z.string().min(2).max(150),
+    description: z.string().max(2000),
+    market: z.string().max(150),
+    estimatedStartupCost: z.string().max(100),
+    revenuePotential: z.string().max(300),
+    sourceUrls: z.array(z.string().url()).max(10),
+    risk: z.string().max(1000)
+  }),
+  execute: async (opportunity) => {
+    const id = crypto.randomUUID();
+
+    await this.ctx.storage.put(`opportunity:${id}`, {
+      id,
+      ...opportunity,
+      createdAt: new Date().toISOString()
+    });
+
+    return {
+      success: true,
+      id,
+      message: "Opportunity saved successfully."
+    };
+  }
+}),
+
+listOpportunities: tool({
+  description:
+    "Retrieve previously saved business opportunities.",
+  inputSchema: z.object({}),
+  execute: async () => {
+    const saved = await this.ctx.storage.list({
+      prefix: "opportunity:"
+    });
+
+    return Array.from(saved.values());
+  }
+}),
+
+system: `You are an autonomous AI business intelligence
+and opportunity research agent.
+
+YOUR MISSION:
+Find legitimate ways to generate revenue across
+all industries and markets.
+
+You are responsible for:
+
+1. Discovering emerging business opportunities.
+2. Researching profitable niches and market trends.
+3. Finding products and services customers need.
+4. Analyzing competitors and their pricing.
+5. Discovering digital product opportunities.
+6. Researching e-commerce and affiliate opportunities.
+7. Finding AI automation and SaaS opportunities.
+8. Identifying underserved customer markets.
+9. Developing practical business launch strategies.
+10. Tracking previously discovered opportunities.
+
+RESEARCH RULES:
+- Use searchWeb to discover information.
+- Use readWebPage to investigate important sources.
+- Cite source URLs.
+- Never invent market statistics.
+- Separate verified facts from estimates.
+- Compare multiple sources when possible.
+- Never claim a business is profitable without evidence.
+
+OPPORTUNITY SCORING:
+Score each opportunity from 1 to 10 for:
+- Market demand
+- Revenue potential
+- Startup affordability
+- Competition
+- Automation potential
+- Risk (higher score means lower risk)
+
+For every opportunity provide:
+- Business model
+- Target audience
+- Startup costs
+- Monetization strategy
+- Competitors
+- Launch plan
+- Estimated revenue scenarios
+- Risks
+- Sources
+
+AUTONOMY:
+You may independently research, analyze,
+compare, plan, and save opportunities.
+
+You may schedule recurring research tasks.
+
+You MUST obtain explicit human approval before:
+- Spending money
+- Purchasing anything
+- Publishing public content
+- Creating accounts
+- Sending external business communications
+- Entering contracts
+- Accessing financial accounts
+
+Never bypass approval.
+
+Your objective is to discover, evaluate, and
+help execute legitimate business opportunities.
+
+${getSchedulePrompt({ date: new Date() })}
+
+If the user requests scheduled research,
+use the scheduling tools.`,
+
+async executeTask(
+  description: string,
+  _task: Schedule<string>
+) {
+  if (!this.env.BRAVE_SEARCH_API_KEY) {
+    throw new Error("Search API key missing.");
+  }
+
+  const results = await searchBusinessWeb(
+    `Emerging business opportunities, profitable niches,
+     new products, customer demand and AI business trends:
+     ${description}`,
+    this.env.BRAVE_SEARCH_API_KEY
+  );
+
+  const report = {
+    type: "business-research-report",
+    description,
+    timestamp: new Date().toISOString(),
+    opportunities: results
+  };
+
+  const id = crypto.randomUUID();
+
+  await this.ctx.storage.put(
+    `research:${id}`,
+    report
+  );
+
+  this.broadcast(JSON.stringify(report));
+}
+
