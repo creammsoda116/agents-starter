@@ -510,4 +510,21 @@ async executeTask(
 
   this.broadcast(JSON.stringify(report));
 }
+python3 - <<'PY'
+from pathlib import Path
 
+p = Path("src/server.ts")
+s = p.read_text()
+
+marker = "satisfies ExportedHandler<Env>;"
+if marker not in s:
+    raise SystemExit("Could not find the expected end of the original server code. No changes made.")
+
+s = s[:s.index(marker) + len(marker)] + "\n"
+p.write_text(s)
+print("Removed the incorrectly appended code.")
+PY
+
+npx oxfmt src/server.ts
+npm run check
+npm run check
